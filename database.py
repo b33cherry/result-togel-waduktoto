@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import json
+from datetime import date, datetime
+from typing import Any
+
+import asyncpg
+
+
+class Database:
+    def __init__(self, url: str):
+        self.url = url
+        self.pool: asyncpg.Pool | None = None
+
+    async def connect(self) -> None:
+        self.pool = await asyncpg.create_pool(
+            self.url,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+        )
+        await self.create_schema()
+
+    async def close(self) -> None:
+        if self.pool:
+            await self.pool.close()
+
+    async def create_schema(self) -> None:
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            CREATE TABLE IF NOT EXISTS markets (
+                id BIGSERIAL PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                open_time TIME NOT NULL,
+                active_days JSONB NOT NULL DEFAULT '[]'::jsonb,
+                result_digits INTEGER NOT NULL DEFAULT 4,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_results (
+                id BIGSERIAL PRIMARY KEY,
+                market_id BIGINT NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+                result_date DATE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'WAITING',
+                result_value TEXT,
+                filled_by_id BIGINT,
+                filled_by_name TEXT,
+                filled_at TIMESTAMPTZ,
+                main_message_id BIGINT,
+                reminder_message_id BIGINT,
+                last_reminder_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(market_id, result_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS result_logs (
+                id BIGSERIAL PRIMARY KEY,
+                market_id BIGINT NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+                result_date DATE NOT NULL,
+                action TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                actor_id BIGINT,
+                actor_name TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_daily_date_status
+                ON daily_results(result_date, status);
+
+            CREATE INDEX IF NOT EXISTS idx_daily_market_date
+                ON daily_results(market_id, result_date);
+            """)
+
+    async def seed_markets(self, markets: list[dict[str, Any]]) -> None:
+        """Insert initial markets, but never overwrite changes made from Telegram."""
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for market in markets:
+                    await conn.execute("""
+                    INSERT INTO markets(
+                        slug, name, open_time, active_days,
+                        result_digits, active
+                    )
+                    VALUES($1,$2,$3::time,$4::jsonb,$5,$6)
+                    ON CONFLICT(slug) DO NOTHING
+                    """,
+                    market["slug"],
+                    market["name"],
+                    market["open_time"],
+                    json.dumps(market.get("active_days", [0,1,2,3,4,5,6])),
+                    int(market.get("result_digits", 4)),
+                    bool(market.get("active", True)))
+
+    async def ensure_day(self, target_date: date) -> None:
+        assert self.pool
+        weekday = target_date.weekday()
+        async with self.pool.acquire() as conn:
+            markets = await conn.fetch("""
+                SELECT id, active_days
+                FROM markets
+                WHERE active=TRUE
+            """)
+            async with conn.transaction():
+                for market in markets:
+                    days = market["active_days"]
+                    if isinstance(days, str):
+                        days = json.loads(days)
+                    status = "WAITING" if weekday in days else "OFF_SCHEDULE"
+                    await conn.execute("""
+                    INSERT INTO daily_results(market_id,result_date,status)
+                    VALUES($1,$2,$3)
+                    ON CONFLICT(market_id,result_date) DO NOTHING
+                    """, market["id"], target_date, status)
+
+    async def today_rows(self, target_date: date):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("""
+            SELECT
+                d.*,
+                m.slug,
+                m.name,
+                m.open_time,
+                m.active_days,
+                m.result_digits,
+                m.active
+            FROM daily_results d
+            JOIN markets m ON m.id=d.market_id
+            WHERE d.result_date=$1 AND m.active=TRUE
+            ORDER BY m.open_time, m.name
+            """, target_date)
+
+    async def daily_by_slug(self, target_date: date, slug: str):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("""
+            SELECT
+                d.*,
+                m.slug,
+                m.name,
+                m.open_time,
+                m.active_days,
+                m.result_digits,
+                m.active
+            FROM daily_results d
+            JOIN markets m ON m.id=d.market_id
+            WHERE d.result_date=$1 AND m.slug=$2
+            """, target_date, slug)
+
+    async def mark_pending(self, daily_id: int, message_id: int) -> None:
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            UPDATE daily_results
+            SET status='PENDING',
+                main_message_id=$2,
+                updated_at=NOW()
+            WHERE id=$1
+            """, daily_id, message_id)
+
+    async def set_main_message(self, daily_id: int, message_id: int) -> None:
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            UPDATE daily_results
+            SET main_message_id=$2,
+                updated_at=NOW()
+            WHERE id=$1
+            """, daily_id, message_id)
+
+    async def set_reminder(
+        self,
+        daily_id: int,
+        message_id: int,
+        sent_at: datetime,
+    ) -> None:
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            UPDATE daily_results
+            SET reminder_message_id=$2,
+                last_reminder_at=$3,
+                updated_at=NOW()
+            WHERE id=$1
+            """, daily_id, message_id, sent_at)
+
+    async def clear_reminder(self, daily_id: int) -> None:
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            UPDATE daily_results
+            SET reminder_message_id=NULL,
+                updated_at=NOW()
+            WHERE id=$1
+            """, daily_id)
+
+    async def save_result(
+        self,
+        target_date: date,
+        slug: str,
+        value: str,
+        actor_id: int,
+        actor_name: str,
+        force_update: bool = False,
+    ):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                SELECT d.*, m.name, m.slug, m.open_time
+                FROM daily_results d
+                JOIN markets m ON m.id=d.market_id
+                WHERE d.result_date=$1 AND m.slug=$2
+                FOR UPDATE
+                """, target_date, slug)
+
+                if not row:
+                    return None
+
+                if row["status"] in ("DONE", "OFF_MANUAL") and not force_update:
+                    return {"error": "already_done", "row": row}
+
+                old_value = row["result_value"]
+                new_status = "OFF_MANUAL" if value == "OFF" else "DONE"
+
+                await conn.execute("""
+                UPDATE daily_results
+                SET status=$3,
+                    result_value=$4,
+                    filled_by_id=$5,
+                    filled_by_name=$6,
+                    filled_at=NOW(),
+                    updated_at=NOW()
+                WHERE result_date=$1 AND market_id=$2
+                """,
+                target_date,
+                row["market_id"],
+                new_status,
+                value,
+                actor_id,
+                actor_name)
+
+                if old_value is not None:
+                    action = "UPDATE_RESULT"
+                elif value == "OFF":
+                    action = "SET_OFF"
+                else:
+                    action = "SET_RESULT"
+
+                await conn.execute("""
+                INSERT INTO result_logs(
+                    market_id,result_date,action,
+                    old_value,new_value,actor_id,actor_name
+                )
+                VALUES($1,$2,$3,$4,$5,$6,$7)
+                """,
+                row["market_id"],
+                target_date,
+                action,
+                old_value,
+                value,
+                actor_id,
+                actor_name)
+
+                return {"row": row, "old_value": old_value}
+
+    async def list_markets(self, include_inactive: bool = True):
+        assert self.pool
+        where = "" if include_inactive else "WHERE active=TRUE"
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(f"""
+            SELECT *
+            FROM markets
+            {where}
+            ORDER BY active DESC, open_time, name
+            """)
+
+    async def get_market(self, slug: str):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("""
+            SELECT * FROM markets WHERE slug=$1
+            """, slug)
+
+    async def add_market(
+        self,
+        slug: str,
+        name: str,
+        open_time: str,
+        days: list[int],
+    ):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("""
+            INSERT INTO markets(
+                slug,name,open_time,active_days,result_digits,active
+            )
+            VALUES($1,$2,$3::time,$4::jsonb,4,TRUE)
+            RETURNING *
+            """, slug, name, open_time, json.dumps(days))
+
+    async def update_market(
+        self,
+        slug: str,
+        *,
+        name: str | None = None,
+        open_time: str | None = None,
+        days: list[int] | None = None,
+    ):
+        assert self.pool
+        fields: list[str] = []
+        values: list[Any] = []
+        index = 1
+
+        if name is not None:
+            fields.append(f"name=${index}")
+            values.append(name)
+            index += 1
+
+        if open_time is not None:
+            fields.append(f"open_time=${index}::time")
+            values.append(open_time)
+            index += 1
+
+        if days is not None:
+            fields.append(f"active_days=${index}::jsonb")
+            values.append(json.dumps(days))
+            index += 1
+
+        if not fields:
+            return await self.get_market(slug)
+
+        values.append(slug)
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(f"""
+            UPDATE markets
+            SET {", ".join(fields)}, updated_at=NOW()
+            WHERE slug=${index}
+            RETURNING *
+            """, *values)
+
+    async def set_market_active(self, slug: str, active: bool):
+        assert self.pool
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("""
+            UPDATE markets
+            SET active=$2, updated_at=NOW()
+            WHERE slug=$1
+            RETURNING *
+            """, slug, active)
